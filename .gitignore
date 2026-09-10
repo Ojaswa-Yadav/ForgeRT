@@ -1,0 +1,9 @@
+build/
+models/
+*.o
+*.a
+*.so
+__pycache__/
+*.pyc
+.venv/
+third_party/nlohmann/json.hpp

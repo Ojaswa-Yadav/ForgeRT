@@ -18,6 +18,7 @@
 #include "rope.cuh"
 #include "attention.cuh"
 #include "elementwise.cuh"
+#include "embed.cuh"
 
 #include <cublas_v2.h>
 #include <cuda_runtime.h>
@@ -55,7 +56,6 @@ void ActivationBuffers::alloc(const ModelConfig& cfg)
     attn_out.alloc(T * H * sizeof(fp16));
     gate    .alloc(T * I * sizeof(fp16));
     up      .alloc(T * I * sizeof(fp16));
-    mlp_out .alloc(T * H * sizeof(fp16));
     logits  .alloc(cfg.vocab_size * sizeof(fp32));
 }
 
@@ -113,26 +113,6 @@ Executor::Executor(const ModelWeights* weights, KVCache* kv_cache)
 Executor::~Executor()
 {
     cublasDestroy(cublas_);
-}
-
-// ---------------------------------------------------------------------------
-// embed_tokens_gather
-// Simple GPU gather: for each position t, copy embed_tokens[token_ids[t], :]
-// into hidden[t, :].
-// token_ids_gpu: device int32 [seq_len]
-// ---------------------------------------------------------------------------
-__global__ static void embed_gather_kernel(
-    const __half* __restrict__ table,  // [vocab, H]
-    const int32_t* __restrict__ ids,   // [seq_len]
-    __half* __restrict__ out,          // [seq_len, H]
-    int seq_len, int H)
-{
-    int t = blockIdx.x;
-    int h = threadIdx.x;
-    if (t >= seq_len || h >= H) return;
-    int tok = ids[t];
-    for (int i = h; i < H; i += blockDim.x)
-        out[t * H + i] = table[tok * H + i];
 }
 
 // ---------------------------------------------------------------------------
@@ -244,23 +224,13 @@ void Executor::run_layer(int layer_idx, int seq_len, int kv_pos, bool is_prefill
 // run_forward  –  shared body of prefill and decode
 // token_ids_gpu: device int32 [seq_len]
 // ---------------------------------------------------------------------------
-static void embed_tokens(
-    cublasHandle_t /*unused*/,
-    const fp16* embed_table, const int32_t* ids_gpu,
-    fp16* out, int seq_len, int H)
-{
-    embed_gather_kernel<<<seq_len, min(H, 256)>>>(embed_table, ids_gpu, out, seq_len, H);
-    CUDA_CHECK(cudaGetLastError());
-}
-
 fp32* Executor::run_forward(const int32_t* ids_gpu, int seq_len, int kv_pos, bool is_prefill)
 {
     const ModelConfig& cfg = weights_->cfg;
     int H = cfg.hidden_size;
 
-    // Embed
-    embed_tokens(cublas_, weights_->embed_tokens, ids_gpu,
-                 act_.hidden.as<fp16>(), seq_len, H);
+    // Embed tokens via GPU gather kernel (embed.cu)
+    embed_gather(weights_->embed_tokens, ids_gpu, act_.hidden.as<fp16>(), seq_len, H);
 
     // Transformer layers
     for (int l = 0; l < cfg.num_layers; l++) {

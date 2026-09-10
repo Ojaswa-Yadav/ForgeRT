@@ -32,6 +32,7 @@ add_library(forgert_kernels STATIC
     kernels/attention_decode.cu
     kernels/elementwise.cu
     kernels/sampling.cu
+    kernels/embed.cu
 )
 target_include_directories(forgert_kernels PUBLIC ${FORGERT_INCLUDE_DIRS})
 set_target_properties(forgert_kernels PROPERTIES CUDA_SEPARABLE_COMPILATION ON)

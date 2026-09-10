@@ -19,9 +19,8 @@ struct ActivationBuffers {
     DeviceBuffer k;            // [max_seq_len, num_kv_heads * head_dim] fp16
     DeviceBuffer v;            // [max_seq_len, num_kv_heads * head_dim] fp16
     DeviceBuffer attn_out;     // [max_seq_len, num_heads * head_dim] fp16
-    DeviceBuffer gate;         // [max_seq_len, intermediate_size] fp16
+    DeviceBuffer gate;         // [max_seq_len, intermediate_size] fp16  (swiglu output)
     DeviceBuffer up;           // [max_seq_len, intermediate_size] fp16
-    DeviceBuffer mlp_out;      // not used (mlp goes directly to hidden via beta=1)
     DeviceBuffer logits;       // [vocab_size] fp32
 
     void alloc(const ModelConfig& cfg);

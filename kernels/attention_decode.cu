@@ -390,12 +390,32 @@ void decode_attn_v3_vec(
 }
 
 // ============================================================
-// v4 – flash-decode: one block per Q head
-// Splits kv_len into tiles of TILE_KV; each tile runs in shared memory.
-// QK scores are accumulated on the fly with online softmax.
-// One global pass → minimal DRAM traffic.
+// v4 – warp-cooperative flash-decode
+//
+// Why this is genuinely faster than v2/v3:
+//
+// v2/v3 assign each lane its OWN set of kv positions (striding by 32).
+// For each position, that lane serially computes the full HEAD_DIM dot product.
+// Problems:
+//   • acc[128] per thread → 128 registers per thread → local-memory spill on
+//     any GPU that can't hold 32 * 128 = 4096 floats per warp in registers.
+//   • Warp merge does 5 * HEAD_DIM shuffles (640 for HD=128) on spilled data.
+//   • KV loads are strided across lanes: lane 0 reads K[pos0], lane 1 reads
+//     K[pos1] where pos1 - pos0 = num_kv_heads * HEAD_DIM → not coalesced.
+//
+// v4 fixes all three:
+//   • All 32 lanes cooperate on ONE kv position at a time (warp splits HEAD_DIM).
+//     Dot product: HEAD_DIM/32 muls per lane + warp reduction = 5 shuffles.
+//   • acc[HEAD_DIM/32] = acc[4] for HD=128 → stays in registers, no spill.
+//   • All lanes read K[t, kv_h, lane], K[t, kv_h, lane+32], ...
+//     → consecutive elements → coalesced L2/HBM transaction.
+//   • Warps (not lanes) split kv_len, providing multi-warp parallelism.
+//   • Cross-warp merge uses shared memory; warp 0 merges in O(NUM_WARPS) steps
+//     per lane — cheap since NUM_WARPS is small (4–8).
+//
+// Shared memory: q_sh + m_sh + d_sh + acc_sh ≈ 3 KB for NUM_WARPS=4, HD=128.
 // ============================================================
-template<int HEAD_DIM, int TILE_KV>
+template<int HEAD_DIM, int NUM_WARPS>
 __global__ void decode_attn_kernel_v4(
     const __half* __restrict__ q,
     const __half* __restrict__ k_cache,
@@ -403,76 +423,112 @@ __global__ void decode_attn_kernel_v4(
     __half*       __restrict__ out,
     int num_heads, int num_kv_heads, int kv_len)
 {
+    static_assert(HEAD_DIM % 32 == 0, "HEAD_DIM must be a multiple of 32");
+    constexpr int ELEMS_PER_LANE = HEAD_DIM / 32;  // e.g. 4 for HD=128
+
     // One block = one Q head
     int h    = blockIdx.x;
     int kv_h = h / (num_heads / num_kv_heads);
     float scale = rsqrtf((float)HEAD_DIM);
 
-    // Q loaded into registers
-    __shared__ float q_sh[HEAD_DIM];
-    if (threadIdx.x < HEAD_DIM) {
-        q_sh[threadIdx.x] = __half2float(q[h * HEAD_DIM + threadIdx.x]);
-    }
+    int lane = threadIdx.x & 31;
+    int wid  = threadIdx.x >> 5;   // warp index within block
+
+    // ------------------------------------------------------------------
+    // Shared memory layout:
+    //   q_sh   [HEAD_DIM]             – Q row (all warps read it)
+    //   m_sh   [NUM_WARPS]            – per-warp max (written after main loop)
+    //   d_sh   [NUM_WARPS]            – per-warp denominator
+    //   acc_sh [NUM_WARPS][HEAD_DIM]  – per-warp accumulators (for merge)
+    // Total (HD=128, NW=4): 512 + 16 + 16 + 2048 = 2592 bytes.
+    // ------------------------------------------------------------------
+    __shared__ float q_sh  [HEAD_DIM];
+    __shared__ float m_sh  [NUM_WARPS];
+    __shared__ float d_sh  [NUM_WARPS];
+    __shared__ float acc_sh[NUM_WARPS][HEAD_DIM];
+
+    // Load Q into shared memory cooperatively (all threads participate)
+    for (int d = threadIdx.x; d < HEAD_DIM; d += blockDim.x)
+        q_sh[d] = __half2float(q[h * HEAD_DIM + d]);
     __syncthreads();
 
-    // Shared buffers for one tile of K and V
-    __shared__ float k_sh[TILE_KV][HEAD_DIM];
-    __shared__ float v_sh[TILE_KV][HEAD_DIM];
+    // ------------------------------------------------------------------
+    // Main loop: warp wid handles positions {wid, wid+NUM_WARPS, ...}
+    // All 32 lanes within the warp cooperate on each position.
+    // ------------------------------------------------------------------
+    float m_local = -FLT_MAX;
+    float d_local = 0.f;
+    float acc[ELEMS_PER_LANE] = {};   // e.g. 4 floats for HD=128 — no spill
 
-    // Per-thread accumulator (HEAD_DIM elements)
-    float m_global = -FLT_MAX;
-    float d_global = 0.f;
-    float acc[HEAD_DIM] = {};
+    for (int t = wid; t < kv_len; t += NUM_WARPS) {
+        const __half* k_ptr = k_cache + ((size_t)t * num_kv_heads + kv_h) * HEAD_DIM;
+        const __half* v_ptr = v_cache + ((size_t)t * num_kv_heads + kv_h) * HEAD_DIM;
 
-    int num_tiles = (kv_len + TILE_KV - 1) / TILE_KV;
-
-    for (int tile = 0; tile < num_tiles; tile++) {
-        int tile_start = tile * TILE_KV;
-        int tile_end   = min(tile_start + TILE_KV, kv_len);
-        int tile_size  = tile_end - tile_start;
-
-        // Cooperatively load K and V for this tile
-        // threadIdx.x indexes into HEAD_DIM
-        for (int kv_t = 0; kv_t < tile_size; kv_t++) {
-            int t = tile_start + kv_t;
-            if (threadIdx.x < HEAD_DIM) {
-                k_sh[kv_t][threadIdx.x] = __half2float(
-                    k_cache[(t * num_kv_heads + kv_h) * HEAD_DIM + threadIdx.x]);
-                v_sh[kv_t][threadIdx.x] = __half2float(
-                    v_cache[(t * num_kv_heads + kv_h) * HEAD_DIM + threadIdx.x]);
-            }
+        // Warp-parallel dot product Q · K[t]
+        // Lane lane reads elements {lane, lane+32, lane+64, ...}
+        // → all lanes access a contiguous 128-byte cache line per HEAD_DIM=128 chunk.
+        float dot = 0.f;
+        for (int e = 0; e < ELEMS_PER_LANE; e++) {
+            int d = lane + e * 32;
+            dot += q_sh[d] * __half2float(k_ptr[d]);
         }
-        __syncthreads();
+        // Warp reduction: all lanes end up with the full dot product
+        for (int off = 16; off > 0; off >>= 1)
+            dot += __shfl_xor_sync(0xFFFFFFFF, dot, off);
+        float score = dot * scale;   // all lanes have the same value
 
-        // Compute scores for this tile (thread 0 to avoid race — see note below)
-        // For a true flash-decode we'd split heads across threads; here we keep
-        // one block per head and use thread 0 for the outer loop to show the
-        // tiling concept clearly.  v3/v2 show the warp parallelism.
-        if (threadIdx.x == 0) {
-            for (int kv_t = 0; kv_t < tile_size; kv_t++) {
-                float dot = 0.f;
-                for (int d = 0; d < HEAD_DIM; d++)
-                    dot += q_sh[d] * k_sh[kv_t][d];
-                float score = dot * scale;
+        // Online softmax update
+        float m_new   = fmaxf(m_local, score);
+        float exp_old = expf(m_local - m_new);
+        float exp_new = expf(score   - m_new);
 
-                float m_new   = fmaxf(m_global, score);
-                float exp_old = expf(m_global - m_new);
-                float exp_new = expf(score    - m_new);
-
-                for (int d = 0; d < HEAD_DIM; d++)
-                    acc[d] = acc[d] * exp_old + v_sh[kv_t][d] * exp_new;
-
-                d_global = d_global * exp_old + exp_new;
-                m_global = m_new;
-            }
-
-            if (tile == num_tiles - 1) {
-                __half* o = out + h * HEAD_DIM;
-                for (int d = 0; d < HEAD_DIM; d++)
-                    o[d] = __float2half(acc[d] / d_global);
-            }
+        // Accumulate V: each lane owns ELEMS_PER_LANE output dimensions
+        for (int e = 0; e < ELEMS_PER_LANE; e++) {
+            int d = lane + e * 32;
+            acc[e] = acc[e] * exp_old + __half2float(v_ptr[d]) * exp_new;
         }
-        __syncthreads();
+        d_local = d_local * exp_old + exp_new;
+        m_local = m_new;
+    }
+
+    // ------------------------------------------------------------------
+    // Write per-warp state to shared memory
+    // ------------------------------------------------------------------
+    if (lane == 0) {
+        m_sh[wid] = m_local;
+        d_sh[wid] = d_local;
+    }
+    for (int e = 0; e < ELEMS_PER_LANE; e++)
+        acc_sh[wid][lane + e * 32] = acc[e];
+    __syncthreads();
+
+    // ------------------------------------------------------------------
+    // Cross-warp merge: done by warp 0
+    // Each lane in warp 0 merges its ELEMS_PER_LANE output dimensions
+    // across all NUM_WARPS warp states.  O(NUM_WARPS) per lane — cheap.
+    // ------------------------------------------------------------------
+    if (wid == 0) {
+        float m_g = m_sh[0];
+        float d_g = d_sh[0];
+        float a[ELEMS_PER_LANE];
+        for (int e = 0; e < ELEMS_PER_LANE; e++)
+            a[e] = acc_sh[0][lane + e * 32];
+
+        for (int w = 1; w < NUM_WARPS; w++) {
+            float m_w   = m_sh[w];
+            float d_w   = d_sh[w];
+            float m_new = fmaxf(m_g, m_w);
+            float eg    = expf(m_g - m_new);
+            float ew    = expf(m_w - m_new);
+            for (int e = 0; e < ELEMS_PER_LANE; e++)
+                a[e] = a[e] * eg + acc_sh[w][lane + e * 32] * ew;
+            d_g = d_g * eg + d_w * ew;
+            m_g = m_new;
+        }
+
+        __half* o = out + h * HEAD_DIM;
+        for (int e = 0; e < ELEMS_PER_LANE; e++)
+            o[lane + e * 32] = __float2half(a[e] / d_g);
     }
 }
 
@@ -480,15 +536,21 @@ void decode_attn_v4_flash(
     const __half* q, const __half* k_cache, const __half* v_cache, __half* out,
     int num_heads, int num_kv_heads, int head_dim, int kv_len, cudaStream_t stream)
 {
-    // Dispatch on head_dim (common values: 64, 128)
+    // 4 warps per block (128 threads).
+    // Shared mem: q_sh + m_sh + d_sh + acc_sh.
+    //   HD=128: 512 + 16 + 16 + 2048 = 2592 bytes — well within 48 KB.
+    //   HD= 64: 256 +  8 +  8 + 1024 = 1296 bytes.
+    constexpr int NUM_WARPS = 4;
+    int threads = NUM_WARPS * 32;
+
     if (head_dim == 128) {
-        decode_attn_kernel_v4<128, 64><<<num_heads, 128, 0, stream>>>(
+        decode_attn_kernel_v4<128, NUM_WARPS><<<num_heads, threads, 0, stream>>>(
             q, k_cache, v_cache, out, num_heads, num_kv_heads, kv_len);
     } else if (head_dim == 64) {
-        decode_attn_kernel_v4<64, 64><<<num_heads, 64, 0, stream>>>(
+        decode_attn_kernel_v4<64, NUM_WARPS><<<num_heads, threads, 0, stream>>>(
             q, k_cache, v_cache, out, num_heads, num_kv_heads, kv_len);
     } else {
-        // Fall back to v3 for non-standard head dims
+        // Unsupported head dim: fall back to v3 rather than silently producing garbage
         decode_attn_v3_vec(q, k_cache, v_cache, out, num_heads, num_kv_heads, head_dim, kv_len, stream);
     }
 }

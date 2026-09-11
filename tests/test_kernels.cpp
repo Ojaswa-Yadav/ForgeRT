@@ -10,6 +10,7 @@
 // ---------------------------------------------------------------------------
 #include "rmsnorm.cuh"
 #include "rope.cuh"
+#include "attention.cuh"
 #include "elementwise.cuh"
 #include "types.h"
 
@@ -220,6 +221,125 @@ static void test_rope_tables() {
 }
 
 // ---------------------------------------------------------------------------
+// CPU reference: decode attention with GQA
+// q:       [num_heads, head_dim]
+// k_cache: [kv_len, num_kv_heads, head_dim]
+// v_cache: [kv_len, num_kv_heads, head_dim]
+// ---------------------------------------------------------------------------
+static std::vector<float> cpu_decode_attn(
+    const std::vector<float>& q,       // [num_heads * head_dim]
+    const std::vector<float>& k_cache, // [kv_len * num_kv_heads * head_dim]
+    const std::vector<float>& v_cache,
+    int num_heads, int num_kv_heads, int head_dim, int kv_len)
+{
+    int gqa = num_heads / num_kv_heads;
+    float scale = 1.f / std::sqrt((float)head_dim);
+    std::vector<float> out(num_heads * head_dim, 0.f);
+
+    for (int h = 0; h < num_heads; h++) {
+        int kv_h = h / gqa;
+        const float* q_h = q.data() + h * head_dim;
+
+        // Compute all scores
+        std::vector<float> scores(kv_len);
+        float max_s = -1e30f;
+        for (int t = 0; t < kv_len; t++) {
+            const float* k_t = k_cache.data() + (t * num_kv_heads + kv_h) * head_dim;
+            float dot = 0.f;
+            for (int d = 0; d < head_dim; d++) dot += q_h[d] * k_t[d];
+            scores[t] = dot * scale;
+            max_s = std::max(max_s, scores[t]);
+        }
+
+        // Softmax
+        float denom = 0.f;
+        for (int t = 0; t < kv_len; t++) {
+            scores[t] = std::exp(scores[t] - max_s);
+            denom += scores[t];
+        }
+
+        // Weighted sum over V
+        float* o = out.data() + h * head_dim;
+        for (int t = 0; t < kv_len; t++) {
+            const float* v_t = v_cache.data() + (t * num_kv_heads + kv_h) * head_dim;
+            float w = scores[t] / denom;
+            for (int d = 0; d < head_dim; d++) o[d] += w * v_t[d];
+        }
+    }
+    return out;
+}
+
+// Run one decode attention variant and check against the CPU reference.
+// atol=5e-2 because fp16 arithmetic + online softmax introduces small differences.
+static void run_decode_attn_test(
+    const std::string& name,
+    void(*kernel_fn)(const __half*, const __half*, const __half*, __half*, int, int, int, int, cudaStream_t),
+    const std::vector<float>& q_h,
+    const std::vector<float>& k_h,
+    const std::vector<float>& v_h,
+    const std::vector<float>& ref,
+    int num_heads, int num_kv_heads, int head_dim, int kv_len)
+{
+    fp16* dq  = upload_fp16(q_h);
+    fp16* dkc = upload_fp16(k_h);
+    fp16* dvc = upload_fp16(v_h);
+    fp16* do_ = nullptr;
+    cudaMalloc(&do_, num_heads * head_dim * sizeof(fp16));
+
+    kernel_fn(dq, dkc, dvc, do_, num_heads, num_kv_heads, head_dim, kv_len, nullptr);
+    cudaDeviceSynchronize();
+
+    auto out = download_fp16(do_, num_heads * head_dim);
+    check(name, allclose(out, ref, 5e-2f));
+
+    cudaFree(dq); cudaFree(dkc); cudaFree(dvc); cudaFree(do_);
+}
+
+static void test_decode_attention() {
+    // Use a small configuration to keep the test fast and the reference manageable.
+    const int num_heads    = 8;
+    const int num_kv_heads = 2;  // GQA ratio = 4
+    const int head_dim     = 64;
+    const int kv_len       = 128;
+
+    auto q  = rand_vec(num_heads    * head_dim, -0.5f, 0.5f);
+    auto kc = rand_vec(kv_len * num_kv_heads * head_dim, -0.5f, 0.5f);
+    auto vc = rand_vec(kv_len * num_kv_heads * head_dim, -0.5f, 0.5f);
+
+    auto ref = cpu_decode_attn(q, kc, vc, num_heads, num_kv_heads, head_dim, kv_len);
+
+    run_decode_attn_test("decode_attn_v1_coal", decode_attn_v1_coal,
+                         q, kc, vc, ref, num_heads, num_kv_heads, head_dim, kv_len);
+    run_decode_attn_test("decode_attn_v2_warp_red", decode_attn_v2_warp_red,
+                         q, kc, vc, ref, num_heads, num_kv_heads, head_dim, kv_len);
+    run_decode_attn_test("decode_attn_v3_vec", decode_attn_v3_vec,
+                         q, kc, vc, ref, num_heads, num_kv_heads, head_dim, kv_len);
+    run_decode_attn_test("decode_attn_v4_flash", decode_attn_v4_flash,
+                         q, kc, vc, ref, num_heads, num_kv_heads, head_dim, kv_len);
+
+    // Also test at kv_len=1 (edge case: just one position in cache)
+    {
+        const int kv1 = 1;
+        auto kc1 = rand_vec(kv1 * num_kv_heads * head_dim, -0.5f, 0.5f);
+        auto vc1 = rand_vec(kv1 * num_kv_heads * head_dim, -0.5f, 0.5f);
+        auto ref1 = cpu_decode_attn(q, kc1, vc1, num_heads, num_kv_heads, head_dim, kv1);
+        run_decode_attn_test("decode_attn_v4_flash (kv_len=1)", decode_attn_v4_flash,
+                             q, kc1, vc1, ref1, num_heads, num_kv_heads, head_dim, kv1);
+    }
+
+    // Test head_dim=128 (covers the other template instantiation)
+    {
+        const int hd2 = 128;
+        auto q2  = rand_vec(num_heads    * hd2, -0.5f, 0.5f);
+        auto kc2 = rand_vec(kv_len * num_kv_heads * hd2, -0.5f, 0.5f);
+        auto vc2 = rand_vec(kv_len * num_kv_heads * hd2, -0.5f, 0.5f);
+        auto ref2 = cpu_decode_attn(q2, kc2, vc2, num_heads, num_kv_heads, hd2, kv_len);
+        run_decode_attn_test("decode_attn_v4_flash (head_dim=128)", decode_attn_v4_flash,
+                             q2, kc2, vc2, ref2, num_heads, num_kv_heads, hd2, kv_len);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 int main() {
@@ -232,6 +352,7 @@ int main() {
     test_swiglu();
     test_residual_add();
     test_rope_tables();
+    test_decode_attention();
 
     std::cout << "\n" << g_tests - g_fails << "/" << g_tests << " tests passed.\n";
     return (g_fails > 0) ? 1 : 0;

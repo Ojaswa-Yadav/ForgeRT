@@ -35,7 +35,6 @@ add_library(forgert_kernels STATIC
     kernels/embed.cu
 )
 target_include_directories(forgert_kernels PUBLIC ${FORGERT_INCLUDE_DIRS})
-set_target_properties(forgert_kernels PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
 target_compile_options(forgert_kernels PRIVATE
     $<$<COMPILE_LANGUAGE:CUDA>:
         -O3

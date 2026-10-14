@@ -26,12 +26,12 @@ KVCache::KVCache(const ModelConfig& config)
     CUDA_CHECK(cudaMemset(buf_.ptr, 0, buf_.size));
 }
 
-fp16* KVCache::key_cache(int layer_idx) const
+fp16* KVCache::key_cache(int layer_idx)
 {
     return buf_.as<fp16>() + (size_t)layer_idx * 2 * layer_stride_;
 }
 
-fp16* KVCache::value_cache(int layer_idx) const
+fp16* KVCache::value_cache(int layer_idx)
 {
     return buf_.as<fp16>() + (size_t)layer_idx * 2 * layer_stride_ + layer_stride_;
 }

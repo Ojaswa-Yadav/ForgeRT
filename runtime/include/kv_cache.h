@@ -18,8 +18,8 @@ public:
     KVCache(const ModelConfig& cfg);
 
     // Pointers into the flat GPU buffer for layer `layer_idx`.
-    fp16* key_cache  (int layer_idx) const;
-    fp16* value_cache(int layer_idx) const;
+    fp16* key_cache  (int layer_idx);
+    fp16* value_cache(int layer_idx);
 
     // Current number of valid tokens stored (updated externally by executor).
     int seq_len = 0;

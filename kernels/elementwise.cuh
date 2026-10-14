@@ -19,3 +19,11 @@ void residual_add(
     const __half* __restrict__ b,
     int n,
     cudaStream_t stream = nullptr);
+
+// Bias broadcast add: out[s, d] += bias[d]   (in-place)
+// out: [seq_len, hidden],  bias: [hidden]
+void bias_add_broadcast(
+    __half* __restrict__ out,
+    const __half* __restrict__ bias,
+    int seq_len, int hidden,
+    cudaStream_t stream = nullptr);

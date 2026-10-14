@@ -131,6 +131,10 @@ void Executor::run_attention(const LayerWeights& lw, int layer_idx,
     hgemm(cublas_, act_.normed.as<fp16>(), lw.q_proj, act_.q.as<fp16>(), seq_len, nH * hd, H);
     hgemm(cublas_, act_.normed.as<fp16>(), lw.k_proj, act_.k.as<fp16>(), seq_len, nK * hd, H);
     hgemm(cublas_, act_.normed.as<fp16>(), lw.v_proj, act_.v.as<fp16>(), seq_len, nK * hd, H);
+    // Add QKV biases if present (e.g. Qwen2)
+    if (lw.q_bias) bias_add_broadcast(act_.q.as<fp16>(), lw.q_bias, seq_len, nH * hd);
+    if (lw.k_bias) bias_add_broadcast(act_.k.as<fp16>(), lw.k_bias, seq_len, nK * hd);
+    if (lw.v_bias) bias_add_broadcast(act_.v.as<fp16>(), lw.v_bias, seq_len, nK * hd);
 
     // RoPE in-place on Q and K
     rope_v2_fused(act_.q.as<fp16>(), act_.k.as<fp16>(),

@@ -193,6 +193,9 @@ std::unique_ptr<ModelWeights> ModelWeights::load(
         total_elems += nelems(pfx + ".self_attn.k_proj.weight");
         total_elems += nelems(pfx + ".self_attn.v_proj.weight");
         total_elems += nelems(pfx + ".self_attn.o_proj.weight");
+        total_elems += nelems(pfx + ".self_attn.q_proj.bias");  // optional (Qwen2)
+        total_elems += nelems(pfx + ".self_attn.k_proj.bias");
+        total_elems += nelems(pfx + ".self_attn.v_proj.bias");
         total_elems += nelems(pfx + ".mlp.gate_proj.weight");
         total_elems += nelems(pfx + ".mlp.up_proj.weight");
         total_elems += nelems(pfx + ".mlp.down_proj.weight");
@@ -221,6 +224,12 @@ std::unique_ptr<ModelWeights> ModelWeights::load(
         weights->lm_head = weights->embed_tokens;  // tied
     }
 
+    // Helper: upload optional tensor (returns nullptr if not in checkpoint)
+    auto upload_optional = [&](const std::string& key) -> fp16* {
+        if (metas.count(key) == 0) return nullptr;
+        return upload_tensor(key);
+    };
+
     for (int l = 0; l < cfg.num_layers; l++) {
         auto pfx = "model.layers." + std::to_string(l);
         auto& lw = weights->layers[l];
@@ -230,6 +239,9 @@ std::unique_ptr<ModelWeights> ModelWeights::load(
         lw.k_proj     = upload_tensor(pfx + ".self_attn.k_proj.weight");
         lw.v_proj     = upload_tensor(pfx + ".self_attn.v_proj.weight");
         lw.o_proj     = upload_tensor(pfx + ".self_attn.o_proj.weight");
+        lw.q_bias     = upload_optional(pfx + ".self_attn.q_proj.bias");
+        lw.k_bias     = upload_optional(pfx + ".self_attn.k_proj.bias");
+        lw.v_bias     = upload_optional(pfx + ".self_attn.v_proj.bias");
         lw.gate_proj  = upload_tensor(pfx + ".mlp.gate_proj.weight");
         lw.up_proj    = upload_tensor(pfx + ".mlp.up_proj.weight");
         lw.down_proj  = upload_tensor(pfx + ".mlp.down_proj.weight");

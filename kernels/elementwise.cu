@@ -73,3 +73,26 @@ void residual_add(
     int blocks  = (n / 2 + threads - 1) / threads;
     residual_add_kernel<<<blocks, threads, 0, stream>>>(a, b, n);
 }
+
+// ---------------------------------------------------------------------------
+// Bias broadcast add: out[s, d] += bias[d]
+// Grid: (seq_len,), each block adds bias to one row.
+// ---------------------------------------------------------------------------
+__global__ void bias_broadcast_kernel(
+    __half* __restrict__       out,
+    const __half* __restrict__ bias,
+    int hidden)
+{
+    int row = blockIdx.x;
+    __half* row_ptr = out + row * hidden;
+    for (int d = threadIdx.x; d < hidden; d += blockDim.x)
+        row_ptr[d] = __hadd(row_ptr[d], bias[d]);
+}
+
+void bias_add_broadcast(
+    __half* out, const __half* bias,
+    int seq_len, int hidden, cudaStream_t stream)
+{
+    int threads = min(hidden, 256);
+    bias_broadcast_kernel<<<seq_len, threads, 0, stream>>>(out, bias, hidden);
+}

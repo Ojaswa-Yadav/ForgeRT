@@ -21,6 +21,9 @@ struct LayerWeights {
     fp16* k_proj       = nullptr;   // [num_kv_heads * head_dim, hidden_size]
     fp16* v_proj       = nullptr;   // [num_kv_heads * head_dim, hidden_size]
     fp16* o_proj       = nullptr;   // [hidden_size, num_heads * head_dim]
+    fp16* q_bias       = nullptr;   // [num_heads * head_dim]   — optional (Qwen2)
+    fp16* k_bias       = nullptr;   // [num_kv_heads * head_dim] — optional
+    fp16* v_bias       = nullptr;   // [num_kv_heads * head_dim] — optional
     fp16* gate_proj    = nullptr;   // [intermediate_size, hidden_size]
     fp16* up_proj      = nullptr;   // [intermediate_size, hidden_size]
     fp16* down_proj    = nullptr;   // [hidden_size, intermediate_size]
